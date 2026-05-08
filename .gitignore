@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MLflow local tracking artifacts
+mlruns/
+models/latest_run_info.json
