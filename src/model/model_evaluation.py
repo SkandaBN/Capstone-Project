@@ -1,7 +1,9 @@
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 import mlflow
 from mlflow.pyfunc import PythonModel
@@ -14,7 +16,7 @@ RUN_INFO_PATH = Path("models/latest_run_info.json")
 
 class ConstantPredictionModel(PythonModel):
     def predict(self, context, model_input):
-        _ = context
+        del context
         return [1] * len(model_input)
 
 
@@ -32,7 +34,8 @@ def validate_artifact_path(artifact_path: str) -> None:
         raise ValueError("artifact_path must be a non-empty string")
 
 
-def log_model_with_compatible_api(artifact_path: str):
+def log_model_with_compatible_api(artifact_path: str) -> Any:
+    """Log model with MLflow 3 `name` and old `artifact_path` compatibility."""
     python_model = ConstantPredictionModel()
     try:
         return mlflow.pyfunc.log_model(
@@ -40,6 +43,11 @@ def log_model_with_compatible_api(artifact_path: str):
             python_model=python_model,
         )
     except TypeError:
+        print(
+            "MLflow fallback: using legacy artifact_path parameter "
+            "for log_model.",
+            file=sys.stderr,
+        )
         return mlflow.pyfunc.log_model(
             artifact_path=artifact_path,
             python_model=python_model,

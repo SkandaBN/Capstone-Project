@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import re
+import sys
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -12,6 +14,8 @@ from mlflow.tracking import MlflowClient
 DEFAULT_EXPERIMENT_NAME = "capstone-model-experiment"
 DEFAULT_ARTIFACT_PATH = "my_model"
 DEFAULT_REGISTERED_MODEL_NAME = "capstone-model"
+RUN_ID_PATTERN = r"[0-9a-f]{32}"
+MLFLOW_MODEL_FILE = "MLmodel"
 RUN_INFO_PATH = Path("models/latest_run_info.json")
 
 
@@ -53,7 +57,14 @@ def get_latest_run_id(experiment_name: str) -> str:
             f"No runs found in experiment '{experiment_name}'. "
             "Run model_evaluation.py first."
         )
-    return runs.iloc[0]["run_id"]
+    run_id = runs.iloc[0]["run_id"]
+    validate_run_id(run_id)
+    return run_id
+
+
+def validate_run_id(run_id: str) -> None:
+    if not re.fullmatch(RUN_ID_PATTERN, run_id):
+        raise ValueError("run_id must be a 32-character lowercase hex string")
 
 
 def model_artifact_exists(
@@ -61,8 +72,11 @@ def model_artifact_exists(
 ) -> bool:
     root_artifacts = client.list_artifacts(run_id)
     for artifact in root_artifacts:
-        if artifact.path == artifact_path:
-            return True
+        if artifact.path == artifact_path and artifact.is_dir:
+            children = client.list_artifacts(run_id, artifact_path)
+            child_paths = {child.path for child in children}
+            if f"{artifact_path}/{MLFLOW_MODEL_FILE}" in child_paths:
+                return True
     return False
 
 
@@ -72,6 +86,8 @@ def get_logged_model_uri(
     run_id: str,
     artifact_path: str,
 ) -> Optional[str]:
+    """Resolve a logged-model URI for the given run."""
+    validate_run_id(run_id)
     experiment = mlflow.get_experiment_by_name(experiment_name)
     if experiment is None:
         return None
@@ -80,19 +96,23 @@ def get_logged_model_uri(
             experiment_ids=[experiment.experiment_id],
             filter_string=f"source_run_id = '{run_id}'",
         )
-    except Exception:
+    except MlflowException as exc:
+        print(
+            f"Warning: failed to search logged models for run '{run_id}': "
+            f"{exc}",
+            file=sys.stderr,
+        )
         return None
 
+    fallback_model_uri = None
     for model in logged_models:
         model_name = getattr(model, "name", "")
         model_uri = getattr(model, "model_uri", None)
         if model_name == artifact_path and model_uri:
             return model_uri
-    for model in logged_models:
-        model_uri = getattr(model, "model_uri", None)
-        if model_uri:
-            return model_uri
-    return None
+        if fallback_model_uri is None and model_uri:
+            fallback_model_uri = model_uri
+    return fallback_model_uri
 
 
 def main():
@@ -123,18 +143,23 @@ def main():
     run_id = args.run_id or saved_run_info.get("run_id") or get_latest_run_id(
         args.experiment_name
     )
+    validate_run_id(run_id)
     client = MlflowClient()
 
     model_uri = f"runs:/{run_id}/{args.artifact_path}"
-    if model_artifact_exists(client, run_id, args.artifact_path):
-        pass
-    else:
+    # Priority:
+    # run artifact URI -> MLflow 3 logged model URI -> saved model URI.
+    if not model_artifact_exists(client, run_id, args.artifact_path):
         model_uri = get_logged_model_uri(
             client,
             args.experiment_name,
             run_id,
             args.artifact_path,
-        ) or saved_run_info.get("model_uri")
+        ) or (
+            saved_run_info.get("model_uri")
+            if saved_run_info.get("run_id") == run_id
+            else None
+        )
 
     if not model_uri:
         root_artifacts = [a.path for a in client.list_artifacts(run_id)]
