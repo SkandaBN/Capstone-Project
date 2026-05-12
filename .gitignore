@@ -226,4 +226,5 @@ cred.text/
 
 # MLflow local tracking artifacts
 mlruns/
+mlflow.db
 models/latest_run_info.json
