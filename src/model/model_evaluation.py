@@ -11,7 +11,7 @@ from mlflow.pyfunc import PythonModel
 
 DEFAULT_EXPERIMENT_NAME = "capstone-model-experiment"
 DEFAULT_ARTIFACT_PATH = "my_model"
-RUN_INFO_PATH = Path("models/latest_run_info.json")
+RUN_INFO_PATH = Path("reports/experiment_info.json")
 
 
 class ConstantPredictionModel(PythonModel):
@@ -23,7 +23,7 @@ class ConstantPredictionModel(PythonModel):
 def configure_tracking() -> str:
     tracking_uri = os.getenv(
         "MLFLOW_TRACKING_URI",
-        f"file://{Path('mlruns').resolve()}",
+        "sqlite:///mlflow.db",
     )
     mlflow.set_tracking_uri(tracking_uri)
     return tracking_uri
@@ -85,6 +85,12 @@ def main():
                 },
                 indent=2,
             ),
+            encoding="utf-8",
+        )
+        metrics_path = Path("reports/metrics.json")
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps({"evaluation_status": "completed"}, indent=2),
             encoding="utf-8",
         )
         print(
