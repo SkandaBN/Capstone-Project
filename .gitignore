@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+cred.txt
+local_s3/
+notebooks/
+data/
+models/
+cred.text/

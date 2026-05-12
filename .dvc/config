@@ -1,0 +1,6 @@
+[cache]
+    dir = C:\dvc-cache
+[core]
+    remote = myremote
+['remote "myremote"']
+    url = s3://complete-datagrid
