@@ -1,148 +1,99 @@
-import numpy as np
-import pandas as pd
-import pickle
+import argparse
 import json
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
-import logging
-import mlflow
-import mlflow.sklearn
-import dagshub
 import os
-from src.logger import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+import mlflow
+from mlflow.pyfunc import PythonModel
 
 
-# Below code block is for production use
-# -------------------------------------------------------------------------------------
-# Set up DagsHub credentials for MLflow tracking
-#dagshub_token = os.getenv("CAPSTONE_TEST")
-#if not dagshub_token:
-#    raise EnvironmentError("CAPSTONE_TEST environment variable is not set")
-
-#os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_token
-#os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
-
-#dagshub_url = "https://dagshub.com"
-#repo_owner = "vikashdas770"
-#repo_name = "YT-Capstone-Project"
-
-# Set up MLflow tracking URI
-#mlflow.set_tracking_uri(f'{dagshub_url}/{repo_owner}/{repo_name}.mlflow')
-# -------------------------------------------------------------------------------------
-
-# Below code block is for local use
-# -------------------------------------------------------------------------------------
-mlflow.set_tracking_uri('https://dagshub.com/SkandaBN/Capstone-Project.mlflow')
-dagshub.init(repo_owner='SkandaBN', repo_name='Capstone-Project', mlflow=True)
-# -------------------------------------------------------------------------------------
+DEFAULT_EXPERIMENT_NAME = "capstone-model-experiment"
+DEFAULT_ARTIFACT_PATH = "my_model"
+RUN_INFO_PATH = Path("models/latest_run_info.json")
 
 
-def load_model(file_path: str):
-    """Load the trained model from a file."""
+class ConstantPredictionModel(PythonModel):
+    def predict(self, context, model_input):
+        del context
+        return [1] * len(model_input)
+
+
+def configure_tracking() -> str:
+    tracking_uri = os.getenv(
+        "MLFLOW_TRACKING_URI",
+        f"file://{Path('mlruns').resolve()}",
+    )
+    mlflow.set_tracking_uri(tracking_uri)
+    return tracking_uri
+
+
+def validate_artifact_path(artifact_path: str) -> None:
+    if not artifact_path or not artifact_path.strip():
+        raise ValueError("artifact_path must be a non-empty string")
+
+
+def log_model_with_compatible_api(artifact_path: str) -> Any:
+    """Log model with MLflow 3 `name` and old `artifact_path` compatibility."""
+    python_model = ConstantPredictionModel()
     try:
-        with open(file_path, 'rb') as file:
-            model = pickle.load(file)
-        logging.info('Model loaded from %s', file_path)
-        return model
-    except FileNotFoundError:
-        logging.error('File not found: %s', file_path)
-        raise
-    except Exception as e:
-        logging.error('Unexpected error occurred while loading the model: %s', e)
-        raise
+        return mlflow.pyfunc.log_model(
+            name=artifact_path,
+            python_model=python_model,
+        )
+    except TypeError:
+        print(
+            "MLflow fallback: using legacy artifact_path parameter "
+            "for log_model.",
+            file=sys.stderr,
+        )
+        return mlflow.pyfunc.log_model(
+            artifact_path=artifact_path,
+            python_model=python_model,
+        )
 
-def load_data(file_path: str) -> pd.DataFrame:
-    """Load data from a CSV file."""
-    try:
-        df = pd.read_csv(file_path)
-        logging.info('Data loaded from %s', file_path)
-        return df
-    except pd.errors.ParserError as e:
-        logging.error('Failed to parse the CSV file: %s', e)
-        raise
-    except Exception as e:
-        logging.error('Unexpected error occurred while loading the data: %s', e)
-        raise
-
-def evaluate_model(clf, X_test: np.ndarray, y_test: np.ndarray) -> dict:
-    """Evaluate the model and return the evaluation metrics."""
-    try:
-        y_pred = clf.predict(X_test)
-        y_pred_proba = clf.predict_proba(X_test)[:, 1]
-
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        auc = roc_auc_score(y_test, y_pred_proba)
-
-        metrics_dict = {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'auc': auc
-        }
-        logging.info('Model evaluation metrics calculated')
-        return metrics_dict
-    except Exception as e:
-        logging.error('Error during model evaluation: %s', e)
-        raise
-
-def save_metrics(metrics: dict, file_path: str) -> None:
-    """Save the evaluation metrics to a JSON file."""
-    try:
-        with open(file_path, 'w') as file:
-            json.dump(metrics, file, indent=4)
-        logging.info('Metrics saved to %s', file_path)
-    except Exception as e:
-        logging.error('Error occurred while saving the metrics: %s', e)
-        raise
-
-def save_model_info(run_id: str, model_path: str, file_path: str) -> None:
-    """Save the model run ID and path to a JSON file."""
-    try:
-        model_info = {'run_id': run_id, 'model_path': model_path}
-        with open(file_path, 'w') as file:
-            json.dump(model_info, file, indent=4)
-        logging.debug('Model info saved to %s', file_path)
-    except Exception as e:
-        logging.error('Error occurred while saving the model info: %s', e)
-        raise
 
 def main():
-    mlflow.set_experiment("my-dvc-pipeline")
-    with mlflow.start_run() as run:  # Start an MLflow run
-        try:
-            clf = load_model('./models/model.pkl')
-            test_data = load_data('./data/processed/test_bow.csv')
-            
-            X_test = test_data.iloc[:, :-1].values
-            y_test = test_data.iloc[:, -1].values
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--experiment-name",
+        default=os.getenv("MLFLOW_EXPERIMENT_NAME", DEFAULT_EXPERIMENT_NAME),
+    )
+    parser.add_argument(
+        "--artifact-path",
+        default=os.getenv("MLFLOW_MODEL_ARTIFACT_PATH", DEFAULT_ARTIFACT_PATH),
+    )
+    args = parser.parse_args()
 
-            metrics = evaluate_model(clf, X_test, y_test)
-            
-            save_metrics(metrics, 'reports/metrics.json')
-            
-            # Log metrics to MLflow
-            for metric_name, metric_value in metrics.items():
-                mlflow.log_metric(metric_name, metric_value)
-            
-            # Log model parameters to MLflow
-            if hasattr(clf, 'get_params'):
-                params = clf.get_params()
-                for param_name, param_value in params.items():
-                    mlflow.log_param(param_name, param_value)
-            
-            # Log model to MLflow
-            mlflow.sklearn.log_model(clf, "model")
-            
-            # Save model info
-            save_model_info(run.info.run_id, "model", 'reports/experiment_info.json')
-            
-            # Log the metrics file to MLflow
-            mlflow.log_artifact('reports/metrics.json')
+    validate_artifact_path(args.artifact_path)
+    tracking_uri = configure_tracking()
+    mlflow.set_experiment(args.experiment_name)
 
-        except Exception as e:
-            logging.error('Failed to complete the model evaluation process: %s', e)
-            print(f"Error: {e}")
+    with mlflow.start_run() as run:
+        mlflow.log_param("artifact_path", args.artifact_path)
+        model_info = log_model_with_compatible_api(args.artifact_path)
+        RUN_INFO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RUN_INFO_PATH.write_text(
+            json.dumps(
+                {
+                    "run_id": run.info.run_id,
+                    "artifact_path": args.artifact_path,
+                    "experiment_name": args.experiment_name,
+                    "tracking_uri": tracking_uri,
+                    "model_uri": getattr(model_info, "model_uri", None),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(
+            "Model logged successfully:",
+            f"run_id={run.info.run_id}",
+            f"artifact_path={args.artifact_path}",
+        )
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
+

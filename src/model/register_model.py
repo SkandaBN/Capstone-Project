@@ -1,109 +1,192 @@
-# register model
-
+import argparse
 import json
-import mlflow
-import mlflow.sklearn
-from src.logger import logging
 import os
-import dagshub
-import pickle
+import re
+import sys
+from pathlib import Path
+from typing import Dict, Optional
 
-import warnings
-warnings.simplefilter("ignore", UserWarning)
-warnings.filterwarnings("ignore")
+import mlflow
+from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
 
 
-def load_model_info(file_path: str) -> dict:
-    """Load the model info from a JSON file."""
-    try:
-        with open(file_path, 'r') as file:
-            model_info = json.load(file)
-        logging.debug('Model info loaded from %s', file_path)
-        return model_info
-    except FileNotFoundError:
-        logging.error('File not found: %s', file_path)
-        raise
-    except Exception as e:
-        logging.error('Unexpected error occurred while loading the model info: %s', e)
-        raise
+DEFAULT_EXPERIMENT_NAME = "capstone-model-experiment"
+DEFAULT_ARTIFACT_PATH = "my_model"
+DEFAULT_REGISTERED_MODEL_NAME = "capstone-model"
+RUN_ID_PATTERN = r"[0-9a-f]{32}"
+MLFLOW_MODEL_FILE = "MLmodel"
+RUN_INFO_PATH = Path("models/latest_run_info.json")
 
-def load_model(file_path: str):
-    """Load the trained model from a file."""
-    try:
-        with open(file_path, 'rb') as file:
-            model = pickle.load(file)
-        logging.info('Model loaded from %s', file_path)
-        return model
-    except Exception as e:
-        logging.error('Error loading model from %s: %s', file_path, e)
-        raise
 
-def save_model_info(run_id: str, model_path: str, file_path: str) -> None:
-    """Save the model run ID and path to a JSON file."""
-    try:
-        model_info = {'run_id': run_id, 'model_path': model_path}
-        with open(file_path, 'w') as file:
-            json.dump(model_info, file, indent=4)
-        logging.debug('Model info saved to %s', file_path)
-    except Exception as e:
-        logging.error('Error occurred while saving the model info: %s', e)
-        raise
+def configure_tracking() -> str:
+    tracking_uri = os.getenv(
+        "MLFLOW_TRACKING_URI",
+        f"file://{Path('mlruns').resolve()}",
+    )
+    mlflow.set_tracking_uri(tracking_uri)
+    return tracking_uri
 
-def register_model(model_name: str, model_obj=None):
-    """Register the model to the MLflow Model Registry using local backend."""
-    try:
-        # Use local MLflow backend for registration
-        local_mlflow_uri = "file:///mlflow"
-        mlflow.set_tracking_uri(local_mlflow_uri)
-        
-        logging.info('Using local MLflow backend for model registration')
-        mlflow.set_experiment("local-model-registry")
-        
-        # Log model locally
-        with mlflow.start_run() as run:
-            run_id = run.info.run_id
-            logging.info(f'Logging model to local run: {run_id}')
-            mlflow.sklearn.log_model(model_obj, "model")
-        
-        # Now register from local run
-        model_uri = f"runs:/{run_id}/model"
-        logging.info(f'Registering model from local URI: {model_uri}')
-        
-        client = mlflow.tracking.MlflowClient()
-        model_version = mlflow.register_model(model_uri, model_name)
-        
-        # Transition to Production stage
-        client.transition_model_version_stage(
-            name=model_name,
-            version=model_version.version,
-            stage="Production"
+
+def validate_artifact_path(artifact_path: str) -> None:
+    if not artifact_path or not artifact_path.strip():
+        raise ValueError("artifact_path must be a non-empty string")
+
+
+def get_saved_run_info() -> Dict[str, str]:
+    if not RUN_INFO_PATH.exists():
+        return {}
+    return json.loads(RUN_INFO_PATH.read_text(encoding="utf-8"))
+
+
+def get_latest_run_id(experiment_name: str) -> str:
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise ValueError(
+            f"Experiment '{experiment_name}' does not exist. "
+            "Run model_evaluation.py first."
         )
-        
-        logging.info(f'✅ Model {model_name} version {model_version.version} successfully registered and transitioned to Production!')
-        logging.info(f'View your model at: file:///mlflow')
-        
-        return model_version
-        
-    except Exception as e:
-        logging.error('Error during model registration: %s', e)
-        raise
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["attributes.start_time DESC"],
+        max_results=1,
+    )
+    if runs.empty:
+        raise ValueError(
+            f"No runs found in experiment '{experiment_name}'. "
+            "Run model_evaluation.py first."
+        )
+    run_id = runs.iloc[0]["run_id"]
+    validate_run_id(run_id)
+    return run_id
+
+
+def validate_run_id(run_id: str) -> None:
+    if not re.fullmatch(RUN_ID_PATTERN, run_id):
+        raise ValueError("run_id must be a 32-character lowercase hex string")
+
+
+def model_artifact_exists(
+    client: MlflowClient, run_id: str, artifact_path: str
+) -> bool:
+    root_artifacts = client.list_artifacts(run_id)
+    for artifact in root_artifacts:
+        if artifact.path == artifact_path and artifact.is_dir:
+            children = client.list_artifacts(run_id, artifact_path)
+            child_paths = {child.path for child in children}
+            if f"{artifact_path}/{MLFLOW_MODEL_FILE}" in child_paths:
+                return True
+    return False
+
+
+def get_logged_model_uri(
+    client: MlflowClient,
+    experiment_name: str,
+    run_id: str,
+    artifact_path: str,
+) -> Optional[str]:
+    """Resolve a logged-model URI for the given run."""
+    validate_run_id(run_id)
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        return None
+    try:
+        logged_models = client.search_logged_models(
+            experiment_ids=[experiment.experiment_id],
+            filter_string=f"source_run_id = '{run_id}'",
+        )
+    except MlflowException as exc:
+        print(
+            f"Warning: failed to search logged models for run '{run_id}': "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    fallback_model_uri = None
+    for model in logged_models:
+        model_name = getattr(model, "name", "")
+        model_uri = getattr(model, "model_uri", None)
+        if model_name == artifact_path and model_uri:
+            return model_uri
+        if fallback_model_uri is None and model_uri:
+            fallback_model_uri = model_uri
+    return fallback_model_uri
+
 
 def main():
-    try:
-        model_info_path = 'reports/experiment_info.json'
-        model_info = load_model_info(model_info_path)
-        
-        # Load the model from local file
-        model_obj = load_model('./models/model.pkl')
-        
-        model_name = "my_model"
-        register_model(model_name, model_obj)
-        
-        logging.info('\n🎉 Model registration completed successfully!')
-        
-    except Exception as e:
-        logging.error('Failed to complete the model registration process: %s', e)
-        print(f"Error: {e}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--registered-model-name",
+        default=os.getenv(
+            "MLFLOW_REGISTERED_MODEL_NAME",
+            DEFAULT_REGISTERED_MODEL_NAME,
+        ),
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default=os.getenv("MLFLOW_EXPERIMENT_NAME", DEFAULT_EXPERIMENT_NAME),
+    )
+    parser.add_argument(
+        "--artifact-path",
+        default=os.getenv("MLFLOW_MODEL_ARTIFACT_PATH", DEFAULT_ARTIFACT_PATH),
+    )
+    parser.add_argument("--run-id", default=os.getenv("MLFLOW_RUN_ID"))
+    args = parser.parse_args()
 
-if __name__ == '__main__':
+    validate_artifact_path(args.artifact_path)
+    saved_run_info = get_saved_run_info()
+    tracking_uri = configure_tracking()
+    mlflow.set_experiment(args.experiment_name)
+
+    run_id = args.run_id or saved_run_info.get("run_id") or get_latest_run_id(
+        args.experiment_name
+    )
+    validate_run_id(run_id)
+    client = MlflowClient()
+
+    model_uri = f"runs:/{run_id}/{args.artifact_path}"
+    # Priority:
+    # run artifact URI -> MLflow 3 logged model URI -> saved model URI.
+    if not model_artifact_exists(client, run_id, args.artifact_path):
+        model_uri = get_logged_model_uri(
+            client,
+            args.experiment_name,
+            run_id,
+            args.artifact_path,
+        ) or (
+            saved_run_info.get("model_uri")
+            if saved_run_info.get("run_id") == run_id
+            else None
+        )
+
+    if not model_uri:
+        root_artifacts = [a.path for a in client.list_artifacts(run_id)]
+        raise FileNotFoundError(
+            "Unable to find a logged model with artifact_path "
+            f"'{args.artifact_path}' in run '{run_id}'. "
+            f"Available root artifacts: {root_artifacts}"
+        )
+    try:
+        result = mlflow.register_model(
+            model_uri=model_uri,
+            name=args.registered_model_name,
+        )
+    except MlflowException as exc:
+        raise RuntimeError(
+            f"Model registration failed for uri '{model_uri}' "
+            f"on tracking uri '{tracking_uri}'."
+        ) from exc
+
+    print(
+        "Model registered successfully:",
+        f"name={result.name}",
+        f"version={result.version}",
+        f"model_uri={model_uri}",
+    )
+
+
+if __name__ == "__main__":
     main()
+
